@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# agent-notify — CLI for pairing a machine with the Agent Notifier relay.
+#
+# Subcommands:
+#   pair      Prompt for the 6-digit pin shown on the watch, exchange it for
+#             a device token, and save the token to ~/.config/agent-notify/token.
+#   status    Print the configured relay, the saved token (hashed), and machine name.
+#   test      Send a synthetic "done" notification through the relay.
+
+set -euo pipefail
+
+CONFIG_DIR="${AGENT_NOTIFY_CONFIG:-$HOME/.config/agent-notify}"
+TOKEN_FILE="$CONFIG_DIR/token"
+RELAY="${AGENT_NOTIFY_RELAY:-}"
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "missing dependency: $1" >&2; exit 1; }
+}
+
+require_relay() {
+  if [[ -z "$RELAY" ]]; then
+    echo "AGENT_NOTIFY_RELAY is not set. Export it to your relay base URL." >&2
+    exit 1
+  fi
+}
+
+cmd_pair() {
+  require_cmd curl
+  require_cmd jq
+  require_relay
+
+  local pin machine body
+  read -r -p "Enter the 6-digit pin shown on your Apple Watch: " pin
+  pin="${pin//[^0-9]/}"
+  if [[ ${#pin} -ne 6 ]]; then
+    echo "Pin must be exactly 6 digits." >&2
+    exit 1
+  fi
+
+  machine="$(hostname -s 2>/dev/null || hostname)"
+
+  body="$(jq -n --arg pin "$pin" --arg machine "$machine" \
+    '{pin:$pin, machine_name:$machine}')"
+
+  local body_file http_code resp
+  body_file="$(mktemp)"
+  http_code="$(curl -sS -o "$body_file" -w '%{http_code}' --max-time 10 \
+    -X POST "${RELAY%/}/v1/pair/complete" \
+    -H "Content-Type: application/json" \
+    -d "$body" || echo "000")"
+  resp="$(cat "$body_file")"
+  rm -f "$body_file"
+
+  case "$http_code" in
+    200) ;;
+    401)
+      echo "Invalid or expired pin. Generate a new one on the watch." >&2
+      exit 1 ;;
+    409)
+      local existing
+      existing="$(jq -r '.machine_name // "another machine"' <<<"$resp" 2>/dev/null || echo "another machine")"
+      echo "This watch is already paired to ${existing}." >&2
+      echo "Revoke it from the watch app (swipe left on the device row) before pairing again." >&2
+      exit 1 ;;
+    429)
+      echo "Too many pairing attempts. Wait a few minutes and try again." >&2
+      exit 1 ;;
+    *)
+      echo "Pairing failed (HTTP ${http_code}): ${resp}" >&2
+      exit 1 ;;
+  esac
+
+  local token
+  token="$(jq -r '.device_token // ""' <<<"$resp")"
+  if [[ -z "$token" ]]; then
+    echo "Server response did not include a device_token:" >&2
+    echo "$resp" >&2
+    exit 1
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+  printf '%s' "$token" > "$TOKEN_FILE"
+  chmod 0600 "$TOKEN_FILE"
+
+  echo "Paired as ${machine} ✓"
+}
+
+cmd_status() {
+  echo "Relay:       ${RELAY:-<unset>}"
+  echo "Config dir:  $CONFIG_DIR"
+  if [[ -r "$TOKEN_FILE" ]]; then
+    local hash
+    hash="$(sha256sum < "$TOKEN_FILE" | cut -c1-12)"
+    echo "Token:       saved (sha256 prefix ${hash})"
+  else
+    echo "Token:       not paired"
+  fi
+  echo "Machine:     $(hostname -s 2>/dev/null || hostname)"
+}
+
+cmd_test() {
+  require_cmd jq
+  require_relay
+  if [[ ! -r "$TOKEN_FILE" ]]; then
+    echo "Not paired. Run \`agent-notify pair\` first." >&2
+    exit 1
+  fi
+
+  local payload
+  payload="$(jq -n \
+    --arg machine "$(hostname -s 2>/dev/null || hostname)" \
+    --arg cwd "$PWD" \
+    '{session_id:"test-session", cwd:$cwd, hook_event_name:"Stop"}')"
+
+  # Re-use notify.sh so the test exercises the real path.
+  local notify_sh
+  notify_sh="$(dirname "$0")/notify.sh"
+  [[ -x "$notify_sh" ]] || notify_sh="$HOME/.claude/agent-notify-notify.sh"
+  if [[ ! -x "$notify_sh" ]]; then
+    echo "Could not find notify.sh. Run install.sh first." >&2
+    exit 1
+  fi
+
+  printf '%s' "$payload" | "$notify_sh" done
+  echo "Sent test notification via $notify_sh"
+}
+
+main() {
+  case "${1:-}" in
+    pair)    cmd_pair "${@:2}" ;;
+    status)  cmd_status "${@:2}" ;;
+    test)    cmd_test "${@:2}" ;;
+    ""|-h|--help|help)
+      cat <<'EOF'
+agent-notify — pair this machine with the Agent Notifier relay
+
+Usage:
+  agent-notify pair       Pair using the 6-digit pin shown on your Apple Watch
+  agent-notify status     Show current configuration
+  agent-notify test       Send a synthetic notification
+
+Environment:
+  AGENT_NOTIFY_RELAY      Base URL of the relay (required)
+  AGENT_NOTIFY_CONFIG     Config dir (default: ~/.config/agent-notify)
+EOF
+      ;;
+    *)
+      echo "Unknown subcommand: $1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
