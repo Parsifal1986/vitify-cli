@@ -11,7 +11,13 @@ set -euo pipefail
 
 CONFIG_DIR="${AGENT_NOTIFY_CONFIG:-$HOME/.config/agent-notify}"
 TOKEN_FILE="$CONFIG_DIR/token"
+RELAY_FILE="$CONFIG_DIR/relay"
 RELAY="${AGENT_NOTIFY_RELAY:-}"
+
+# Fall back to the file install.sh wrote so users don't have to export anything.
+if [[ -z "$RELAY" && -r "$RELAY_FILE" ]]; then
+  RELAY="$(tr -d '[:space:]' < "$RELAY_FILE" 2>/dev/null || true)"
+fi
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "missing dependency: $1" >&2; exit 1; }
@@ -19,7 +25,8 @@ require_cmd() {
 
 require_relay() {
   if [[ -z "$RELAY" ]]; then
-    echo "AGENT_NOTIFY_RELAY is not set. Export it to your relay base URL." >&2
+    echo "Relay URL is not set." >&2
+    echo "  Either re-run install.sh, or export AGENT_NOTIFY_RELAY to your relay base URL." >&2
     exit 1
   fi
 }

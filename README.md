@@ -18,7 +18,7 @@ Once the watch app is paired with your iPhone, install the CLI on each
 machine where you run Claude Code or Codex:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Parsifal1986/vitify-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Parsifal1986/vitify-cli/master/install.sh | bash
 ```
 
 What this does:
