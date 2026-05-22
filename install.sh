@@ -9,7 +9,7 @@
 #
 # Env overrides:
 #   VITIFY_REPO        owner/repo on GitHub        (default: Parsifal1986/vitify-cli)
-#   VITIFY_VERSION     git tag or "latest"         (default: latest)
+#   VITIFY_VERSION     branch, tag, or "latest"    (default: latest → master)
 #   VITIFY_RELAY       relay base URL              (default: baked-in production)
 #   VITIFY_BIN_DIR     where to install CLI        (default: ~/.local/bin)
 
@@ -46,9 +46,9 @@ require_cmd jq
 SCRIPT_DIR="$( (cd "$(dirname "${BASH_SOURCE[0]:-/dev/null}")" 2>/dev/null && pwd) || echo "" )"
 
 if [[ "$VITIFY_VERSION" == "latest" ]]; then
-  ASSET_BASE="https://github.com/${VITIFY_REPO}/releases/latest/download"
+  ASSET_BASE="https://raw.githubusercontent.com/${VITIFY_REPO}/master"
 else
-  ASSET_BASE="https://github.com/${VITIFY_REPO}/releases/download/${VITIFY_VERSION}"
+  ASSET_BASE="https://raw.githubusercontent.com/${VITIFY_REPO}/${VITIFY_VERSION}"
 fi
 
 fetch() {
