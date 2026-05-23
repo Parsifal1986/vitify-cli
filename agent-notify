@@ -141,7 +141,10 @@ cmd_update() {
 
   echo "Fetching latest installer from $INSTALLER_URL"
   local tmp
-  tmp="$(mktemp -t vitify-install)"
+  # Explicit template path is portable across BSD (macOS) and GNU (Linux) mktemp.
+  # `-t prefix` works on BSD but GNU treats it as a template and rejects the
+  # missing X's.
+  tmp="$(mktemp "${TMPDIR:-/tmp}/vitify-install.XXXXXX")"
   if ! curl -fsSL "$INSTALLER_URL" -o "$tmp"; then
     echo "Failed to download installer." >&2
     rm -f "$tmp"
