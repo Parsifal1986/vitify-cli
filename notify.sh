@@ -3,10 +3,17 @@
 # Reads hook JSON from stdin, builds an event-specific summary, fires a
 # fire-and-forget HTTPS POST to the relay. Must NEVER exit non-zero — a
 # non-zero exit from a hook can block the agent.
+#
+# Quiescence timer: if Claude's last assistant turn invoked a self-resume
+# tool (ScheduleWakeup / CronCreate), the notification is deferred via a
+# detached sleeper. The next Stop hook for this session kills that sleeper
+# and either restarts it (still pending) or fires immediately (truly done).
+# Net effect: user only gets paged once Claude has actually been quiet.
 
 set -u
 
 EVENT_KIND="${1:-done}"   # done | needs_input | error
+QUIESCE_SECONDS=600       # how long Claude must stay quiet before we page
 
 CONFIG_DIR="${AGENT_NOTIFY_CONFIG:-$HOME/.config/agent-notify}"
 TOKEN_FILE="$CONFIG_DIR/token"
@@ -31,17 +38,8 @@ PAYLOAD="$(cat || true)"
 SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // ""' 2>/dev/null || echo "")"
 CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""' 2>/dev/null || echo "")"
 HOOK_EVENT="$(printf '%s' "$PAYLOAD" | jq -r '.hook_event_name // ""' 2>/dev/null || echo "")"
+TRANSCRIPT_PATH="$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""' 2>/dev/null || echo "")"
 [[ -z "$SESSION_ID" ]] && SESSION_ID="unknown"
-
-# Debounce: 60s window per session
-MARKER="/tmp/agent-notify-${SESSION_ID}"
-if [[ -f "$MARKER" ]]; then
-  NOW="$(date +%s)"
-  MTIME="$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)"
-  AGE=$(( NOW - MTIME ))
-  (( AGE < 60 )) && exit 0
-fi
-touch "$MARKER" 2>/dev/null || true
 
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 CWD_BASENAME="$(basename -- "$CWD" 2>/dev/null || echo "")"
@@ -95,14 +93,77 @@ BODY="$(jq -n \
 TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
 [[ -z "$TOKEN" ]] && exit 0
 
-# Fire-and-forget POST with 5s timeout. Detach so the agent never waits.
-(
+fire_notification() {
   curl -fsS --max-time 5 \
     -X POST "${RELAY%/}/v1/notify" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Content-Type: application/json" \
     -d "$BODY" >/dev/null 2>&1
-) &
+}
+
+# --- Quiescence timer ---
+# Any prior sleeper for this session is now stale. Kill it whether we end up
+# restarting the timer (still pending) or firing immediately (truly done).
+PENDING_MARKER="/tmp/agent-notify-pending-${SESSION_ID}"
+if [[ -f "$PENDING_MARKER" ]]; then
+  OLD_PID="$(cat "$PENDING_MARKER" 2>/dev/null || echo "")"
+  [[ -n "$OLD_PID" ]] && kill "$OLD_PID" 2>/dev/null || true
+  rm -f "$PENDING_MARKER" 2>/dev/null || true
+fi
+
+# Detect self-resume: scan only the most recent assistant turn in the JSONL
+# transcript for a tool call that implies Claude will come back on its own.
+# Older turns don't matter — what we care about is whether *this* Stop will
+# be followed by a self-triggered wake.
+#   ScheduleWakeup / CronCreate  → explicit scheduled resume
+#   Monitor                      → streaming a background task, will resume
+#                                  on each event
+#   Bash w/ run_in_background    → background task whose completion will
+#                                  re-trigger Claude
+HAS_PENDING_WAKE=false
+if [[ "$HOOK_EVENT" == "Stop" && -n "$TRANSCRIPT_PATH" && -r "$TRANSCRIPT_PATH" ]]; then
+  LAST_ASSISTANT="$(awk '/"type":"assistant"/ {last=$0} END {print last}' "$TRANSCRIPT_PATH" 2>/dev/null || true)"
+  if [[ -n "$LAST_ASSISTANT" ]]; then
+    WAKE_HIT="$(printf '%s' "$LAST_ASSISTANT" | jq -r '
+      .message.content[]?
+      | select(.type=="tool_use")
+      | select(
+          (.name == "ScheduleWakeup") or
+          (.name == "CronCreate") or
+          (.name == "Monitor") or
+          (.name == "Bash" and (.input.run_in_background == true))
+        )
+      | .name
+    ' 2>/dev/null || true)"
+    [[ -n "$WAKE_HIT" ]] && HAS_PENDING_WAKE=true
+  fi
+fi
+
+if $HAS_PENDING_WAKE; then
+  # Spawn a detached sleeper. If another Stop fires before it expires, the
+  # cancel block above kills this PID and the curl never runs.
+  (
+    sleep "$QUIESCE_SECONDS"
+    fire_notification
+    rm -f "$PENDING_MARKER" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+  SLEEPER_PID=$!
+  disown 2>/dev/null || true
+  printf '%s\n' "$SLEEPER_PID" > "$PENDING_MARKER"
+  exit 0
+fi
+
+# Truly done — apply 60s burst debounce, then fire-and-forget.
+MARKER="/tmp/agent-notify-${SESSION_ID}"
+if [[ -f "$MARKER" ]]; then
+  NOW="$(date +%s)"
+  MTIME="$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)"
+  AGE=$(( NOW - MTIME ))
+  (( AGE < 60 )) && exit 0
+fi
+touch "$MARKER" 2>/dev/null || true
+
+( fire_notification ) &
 disown 2>/dev/null || true
 
 exit 0
