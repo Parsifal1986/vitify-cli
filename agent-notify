@@ -6,6 +6,8 @@
 #             a device token, and save the token to ~/.config/agent-notify/token.
 #   status    Print the configured relay, the saved token (hashed), and machine name.
 #   test      Send a synthetic "done" notification through the relay.
+#   update    Re-download and re-run the public installer, preserving the
+#             currently-configured relay and existing token.
 
 set -euo pipefail
 
@@ -13,6 +15,7 @@ CONFIG_DIR="${AGENT_NOTIFY_CONFIG:-$HOME/.config/agent-notify}"
 TOKEN_FILE="$CONFIG_DIR/token"
 RELAY_FILE="$CONFIG_DIR/relay"
 RELAY="${AGENT_NOTIFY_RELAY:-}"
+INSTALLER_URL="${VITIFY_INSTALLER_URL:-https://raw.githubusercontent.com/Parsifal1986/vitify-cli/master/install.sh}"
 
 # Fall back to the file install.sh wrote so users don't have to export anything.
 if [[ -z "$RELAY" && -r "$RELAY_FILE" ]]; then
@@ -133,11 +136,34 @@ cmd_test() {
   echo "Sent test notification via $notify_sh"
 }
 
+cmd_update() {
+  require_cmd curl
+
+  echo "Fetching latest installer from $INSTALLER_URL"
+  local tmp
+  tmp="$(mktemp -t vitify-install)"
+  if ! curl -fsSL "$INSTALLER_URL" -o "$tmp"; then
+    echo "Failed to download installer." >&2
+    rm -f "$tmp"
+    exit 1
+  fi
+
+  # Pass the currently-configured relay through so an update doesn't silently
+  # reset it to the baked-in default (matters for custom/dev relays).
+  [[ -n "$RELAY" ]] && export VITIFY_RELAY="$RELAY"
+
+  # exec replaces this process so the running agent-notify binary is no
+  # longer being read when install.sh overwrites it. Otherwise bash can
+  # error mid-script with "file truncated".
+  exec bash "$tmp"
+}
+
 main() {
   case "${1:-}" in
     pair)    cmd_pair "${@:2}" ;;
     status)  cmd_status "${@:2}" ;;
     test)    cmd_test "${@:2}" ;;
+    update)  cmd_update "${@:2}" ;;
     ""|-h|--help|help)
       cat <<'EOF'
 agent-notify — pair this machine with the Agent Notifier relay
@@ -146,10 +172,12 @@ Usage:
   agent-notify pair       Pair using the 6-digit pin shown on your Apple Watch
   agent-notify status     Show current configuration
   agent-notify test       Send a synthetic notification
+  agent-notify update     Re-run the public installer to pick up the latest CLI
 
 Environment:
   AGENT_NOTIFY_RELAY      Base URL of the relay (required)
   AGENT_NOTIFY_CONFIG     Config dir (default: ~/.config/agent-notify)
+  VITIFY_INSTALLER_URL    Installer URL used by `update` (default: public mirror)
 EOF
       ;;
     *)
