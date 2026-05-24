@@ -9,10 +9,20 @@ away while your agent works, and get a haptic the moment it stops or needs you.
 - **Permission requested** (Codex) → same.
 - Tap **Got it** to dismiss, **Remind me in 10m** to snooze.
 
+## Join the Beta
+
+Vitify is currently available through Apple TestFlight.
+
+Because the beta requires both the iOS/watchOS app and CLI pairing, access is currently invite-based.
+
+Request beta access here: https://docs.google.com/forms/d/e/1FAIpQLSer5u7BLAKBWzUS6UvMVAXy-1eaQJODijiXrkMiaUI7gKxIIg/viewform?usp=dialog
+
+Please include your GitHub username and the agent tools you use, such as Claude Code, Codex, or both.
+
 ## Install
 
-You'll need the [**Vitify**](#) iOS + watch app installed first (TestFlight
-invite required — open an issue or contact the maintainer).
+You'll need the **Vitify** iOS + watch app installed first — see
+[Join the Beta](#join-the-beta) above for a TestFlight invite.
 
 Once the watch app is paired with your iPhone, install the CLI on each
 machine where you run Claude Code or Codex:
