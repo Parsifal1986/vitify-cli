@@ -117,9 +117,13 @@ merge_hook() {
 
 merge_hook "$CLAUDE_CFG" "Stop"              "done"
 merge_hook "$CLAUDE_CFG" "Notification"      "needs_input"
+# UserPromptSubmit cancels any pending notification — the user is at the
+# keyboard, so don't page them in 30s for the turn that just ended.
+merge_hook "$CLAUDE_CFG" "UserPromptSubmit"  "cancel"
 # Codex has no Notification event; PermissionRequest is the closest signal.
 merge_hook "$CODEX_CFG"  "Stop"              "done"
 merge_hook "$CODEX_CFG"  "PermissionRequest" "needs_input"
+merge_hook "$CODEX_CFG"  "UserPromptSubmit"  "cancel"
 
 # ─── Next steps ───────────────────────────────────────────────────────────
 echo

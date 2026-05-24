@@ -4,16 +4,22 @@
 # fire-and-forget HTTPS POST to the relay. Must NEVER exit non-zero — a
 # non-zero exit from a hook can block the agent.
 #
+# Send delay: every notification is held in a detached sleeper for a short
+# window before firing. Any subsequent hook for the same session (Stop,
+# Notification, or a UserPromptSubmit invoked with `cancel`) kills the
+# pending sleeper. If the user replies before the window expires, the
+# notification is dropped — they're already at the keyboard.
+#
 # Quiescence timer: if Claude's last assistant turn invoked a self-resume
-# tool (ScheduleWakeup / CronCreate), the notification is deferred via a
-# detached sleeper. The next Stop hook for this session kills that sleeper
-# and either restarts it (still pending) or fires immediately (truly done).
-# Net effect: user only gets paged once Claude has actually been quiet.
+# tool (ScheduleWakeup / CronCreate / Monitor / backgrounded Bash), the
+# window is extended so we don't page while Claude is still iterating.
 
 set -u
 
-EVENT_KIND="${1:-done}"   # done | needs_input | error
-QUIESCE_SECONDS=600       # how long Claude must stay quiet before we page
+EVENT_KIND="${1:-done}"   # done | needs_input | cancel
+SEND_DELAY=30             # default window before firing — gives the user a
+                          # chance to respond before we page
+QUIESCE_SECONDS=600       # extended window when Claude has a pending self-wake
 
 CONFIG_DIR="${AGENT_NOTIFY_CONFIG:-$HOME/.config/agent-notify}"
 TOKEN_FILE="$CONFIG_DIR/token"
@@ -40,6 +46,24 @@ CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""' 2>/dev/null || echo "")"
 HOOK_EVENT="$(printf '%s' "$PAYLOAD" | jq -r '.hook_event_name // ""' 2>/dev/null || echo "")"
 TRANSCRIPT_PATH="$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""' 2>/dev/null || echo "")"
 [[ -z "$SESSION_ID" ]] && SESSION_ID="unknown"
+
+PENDING_MARKER="/tmp/agent-notify-pending-${SESSION_ID}"
+
+cancel_pending() {
+  if [[ -f "$PENDING_MARKER" ]]; then
+    local old_pid
+    old_pid="$(cat "$PENDING_MARKER" 2>/dev/null || echo "")"
+    [[ -n "$old_pid" ]] && kill "$old_pid" 2>/dev/null || true
+    rm -f "$PENDING_MARKER" 2>/dev/null || true
+  fi
+}
+
+# UserPromptSubmit short-circuit: the user is at the keyboard, so any
+# pending notification for this session is no longer interesting.
+if [[ "$EVENT_KIND" == "cancel" ]]; then
+  cancel_pending
+  exit 0
+fi
 
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 CWD_BASENAME="$(basename -- "$CWD" 2>/dev/null || echo "")"
@@ -101,15 +125,9 @@ fire_notification() {
     -d "$BODY" >/dev/null 2>&1
 }
 
-# --- Quiescence timer ---
-# Any prior sleeper for this session is now stale. Kill it whether we end up
-# restarting the timer (still pending) or firing immediately (truly done).
-PENDING_MARKER="/tmp/agent-notify-pending-${SESSION_ID}"
-if [[ -f "$PENDING_MARKER" ]]; then
-  OLD_PID="$(cat "$PENDING_MARKER" 2>/dev/null || echo "")"
-  [[ -n "$OLD_PID" ]] && kill "$OLD_PID" 2>/dev/null || true
-  rm -f "$PENDING_MARKER" 2>/dev/null || true
-fi
+# Any prior sleeper for this session is now stale — kill it before we
+# decide what to do next.
+cancel_pending
 
 # Detect self-resume: scan only the most recent assistant turn in the JSONL
 # transcript for a tool call that implies Claude will come back on its own.
@@ -140,30 +158,36 @@ if [[ "$HOOK_EVENT" == "Stop" && -n "$TRANSCRIPT_PATH" && -r "$TRANSCRIPT_PATH" 
 fi
 
 if $HAS_PENDING_WAKE; then
-  # Spawn a detached sleeper. If another Stop fires before it expires, the
-  # cancel block above kills this PID and the curl never runs.
-  (
-    sleep "$QUIESCE_SECONDS"
-    fire_notification
-    rm -f "$PENDING_MARKER" 2>/dev/null || true
-  ) >/dev/null 2>&1 &
-  SLEEPER_PID=$!
-  disown 2>/dev/null || true
-  printf '%s\n' "$SLEEPER_PID" > "$PENDING_MARKER"
-  exit 0
+  DELAY="$QUIESCE_SECONDS"
+else
+  DELAY="$SEND_DELAY"
 fi
 
-# Truly done — apply 60s burst debounce, then fire-and-forget.
+# 60s post-fire debounce, applied at fire time so stacked sleepers don't
+# all fire in a burst.
 MARKER="/tmp/agent-notify-${SESSION_ID}"
-if [[ -f "$MARKER" ]]; then
-  NOW="$(date +%s)"
-  MTIME="$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)"
-  AGE=$(( NOW - MTIME ))
-  (( AGE < 60 )) && exit 0
-fi
-touch "$MARKER" 2>/dev/null || true
+fire_with_debounce() {
+  if [[ -f "$MARKER" ]]; then
+    local now mtime age
+    now="$(date +%s)"
+    mtime="$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)"
+    age=$(( now - mtime ))
+    (( age < 60 )) && return
+  fi
+  touch "$MARKER" 2>/dev/null || true
+  fire_notification
+}
 
-( fire_notification ) &
+# Spawn a detached sleeper. A subsequent hook for this session (Stop,
+# Notification, PermissionRequest, or UserPromptSubmit→cancel) kills this
+# PID via cancel_pending above and the curl never runs.
+(
+  sleep "$DELAY"
+  fire_with_debounce
+  rm -f "$PENDING_MARKER" 2>/dev/null || true
+) >/dev/null 2>&1 &
+SLEEPER_PID=$!
 disown 2>/dev/null || true
+printf '%s\n' "$SLEEPER_PID" > "$PENDING_MARKER"
 
 exit 0
