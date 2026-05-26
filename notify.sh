@@ -24,7 +24,23 @@ QUIESCE_SECONDS=600       # extended window when Claude has a pending self-wake
 CONFIG_DIR="${AGENT_NOTIFY_CONFIG:-$HOME/.config/agent-notify}"
 TOKEN_FILE="$CONFIG_DIR/token"
 RELAY_FILE="$CONFIG_DIR/relay"
+LOG_FILE="$CONFIG_DIR/debug.log"
 RELAY="${AGENT_NOTIFY_RELAY:-}"
+
+# Opt-in diagnostic logging. Enable with `touch ~/.config/agent-notify/debug.log`,
+# disable with `rm`. Records timestamps, event kinds, session IDs, sleeper PIDs,
+# and curl exit codes — never the bearer token, relay URL, or payload.
+_ts() {
+  perl -MTime::HiRes -e \
+    'my @t=Time::HiRes::gettimeofday(); printf "%d.%03d\n", $t[0], int($t[1]/1000)' \
+    2>/dev/null || date '+%s'
+}
+log_event() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  printf '%s pid=%d session=%s kind=%s hook=%s %s\n' \
+    "$(_ts)" "$$" "${SESSION_ID:-unset}" "$EVENT_KIND" "${HOOK_EVENT:-unset}" "$*" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
 
 # Fall back to relay file so hooks work without relying on shell init order.
 if [[ -z "$RELAY" && -r "$RELAY_FILE" ]]; then
@@ -53,10 +69,15 @@ cancel_pending() {
   if [[ -f "$PENDING_MARKER" ]]; then
     local old_pid
     old_pid="$(cat "$PENDING_MARKER" 2>/dev/null || echo "")"
+    log_event "cancel_pending found_pid=${old_pid:-empty}"
     [[ -n "$old_pid" ]] && kill "$old_pid" 2>/dev/null || true
     rm -f "$PENDING_MARKER" 2>/dev/null || true
+  else
+    log_event "cancel_pending no_marker"
   fi
 }
+
+log_event "hook_start"
 
 # UserPromptSubmit short-circuit: the user is at the keyboard, so any
 # pending notification for this session is no longer interesting.
@@ -83,6 +104,18 @@ case "$HOOK_EVENT" in
       SUMMARY="${TOOL}: ${DETAIL}"
     else
       SUMMARY="Permission needed${TOOL:+: $TOOL}"
+    fi
+    ;;
+  PreToolUse)
+    # Claude Code: arm a sleeper before every approval-prone tool call.
+    # Paired with PostToolUse → cancel, so quick/auto-allowed tools never
+    # buzz; only tools that block on user permission past the send window do.
+    TOOL="$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // ""' 2>/dev/null || echo "")"
+    DETAIL="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // .tool_input.file_path // .tool_input.description // ""' 2>/dev/null || echo "")"
+    if [[ -n "$DETAIL" ]]; then
+      SUMMARY="${TOOL}: ${DETAIL}"
+    else
+      SUMMARY="${TOOL:-Tool} pending approval"
     fi
     ;;
   Stop)
@@ -163,31 +196,24 @@ else
   DELAY="$SEND_DELAY"
 fi
 
-# 60s post-fire debounce, applied at fire time so stacked sleepers don't
-# all fire in a burst.
-MARKER="/tmp/agent-notify-${SESSION_ID}"
-fire_with_debounce() {
-  if [[ -f "$MARKER" ]]; then
-    local now mtime age
-    now="$(date +%s)"
-    mtime="$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)"
-    age=$(( now - mtime ))
-    (( age < 60 )) && return
-  fi
-  touch "$MARKER" 2>/dev/null || true
-  fire_notification
-}
+log_event "sleeper_arming delay=$DELAY pending_wake=$HAS_PENDING_WAKE"
 
 # Spawn a detached sleeper. A subsequent hook for this session (Stop,
 # Notification, PermissionRequest, or UserPromptSubmit→cancel) kills this
-# PID via cancel_pending above and the curl never runs.
+# PID via cancel_pending above and the curl never runs. Burst suppression
+# is handled by that cancellation plus the quiesce window above — no
+# separate post-fire debounce is needed.
 (
+  log_event "sleeper_run delay=$DELAY"
   sleep "$DELAY"
-  fire_with_debounce
+  log_event "sleeper_fired"
+  fire_notification
+  log_event "curl_done exit=$?"
   rm -f "$PENDING_MARKER" 2>/dev/null || true
 ) >/dev/null 2>&1 &
 SLEEPER_PID=$!
 disown 2>/dev/null || true
 printf '%s\n' "$SLEEPER_PID" > "$PENDING_MARKER"
+log_event "sleeper_armed pid=$SLEEPER_PID"
 
 exit 0
